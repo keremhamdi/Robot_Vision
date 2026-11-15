@@ -15,6 +15,11 @@ Run (arm page running, camera calibrated, same as pick_v4):
     python voice_pick.py --vlm ollama --auto               # no "press Enter to grab" prompt (demo day)
 Try without microphone or arm:
     python voice_pick.py --text "please bring me the water bottle" --dry-run
+Try on a saved photo (no arm at all): masks the object, shows the grasp points, saves runs/voice_pick.jpg
+    python voice_pick.py --image wrist1.jpeg --text "pick the white ring" --vlm none
+    python voice_pick.py --image wrist1.jpeg --vlm ollama          # same, but speaking into the mic
+Image mode never moves the arm. The mask and grasp points are real; the table x,y in cm are only
+meaningful if the photo comes from the camera that camera.json was calibrated on.
 
 By default pick_v4 still asks "Press Enter to grab" before the arm moves; --auto removes that.
 --dry-run detects and shows the target but never moves the arm.
@@ -99,8 +104,13 @@ class Listener:
 
 def run_pick(target, category, a, pick_main=None):
     argv = ["--target", target, "--category", category, "--vlm", a.vlm, "--arm-url", a.arm_url,
-            "--items", a.items, "--no-show"]
-    if not a.dry_run:
+            "--items", a.items]
+    if getattr(a, "image", None):                # offline: saved photo, never moves the arm
+        os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+        argv += ["--image", a.image, "--calib", a.calib, "--out", a.out]
+    else:
+        argv.append("--no-show")
+    if not a.dry_run and not getattr(a, "image", None):
         argv.append("--go")
         if a.auto:
             argv.append("-y")
@@ -149,6 +159,9 @@ def main(argv=None):
     ap.add_argument("--bowl", nargs=2, type=float, metavar=("X", "Y"), help="put the object down here (cm)")
     ap.add_argument("--auto", action="store_true", help="grab without asking 'Press Enter'")
     ap.add_argument("--dry-run", action="store_true", help="never move the arm")
+    ap.add_argument("--image", help="offline: use this saved photo instead of the live camera (no arm)")
+    ap.add_argument("--calib", default=os.path.join(HERE, "camera.json"), help="calibration file for --image")
+    ap.add_argument("--out", default=os.path.join(HERE, "runs", "voice_pick.jpg"), help="result picture for --image")
     ap.add_argument("--text", help="skip the microphone: use this sentence once")
     ap.add_argument("--whisper-model", default="small.en", help="e.g. base.en (faster), small.en, medium.en")
     ap.add_argument("--lang", default="en")

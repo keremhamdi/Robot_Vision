@@ -18,6 +18,8 @@ class Match(unittest.TestCase):
         self.ok("get the pillbox", "blue pill box")
         self.ok("Feetech servo box", "Feetech servo box")
         self.ok("the foam ring please", "foam ring")
+        self.ok("pick the white ring", "foam ring")
+        self.ok("pick the white box", "white box")
 
     def test_refuses_unknown_and_close_but_wrong(self):
         for t in ("bring me the red soda can", "hello there", "", "the blue box", "pick up the keys"):
@@ -39,6 +41,16 @@ class Handle(unittest.TestCase):
         self.assertEqual(argv[argv.index("--target") + 1], "water bottle")
         self.assertEqual(argv[argv.index("--category") + 1], "bottle")
         self.assertIn("--go", argv); self.assertIn("-y", argv); self.assertIn("--place", argv)
+
+    def test_image_mode_never_goes_even_with_auto(self):
+        seen = []
+        V.handle("pick the white ring", NAMES, self.args(image="wrist1.jpeg", calib="camera.json", out="/tmp/v.jpg",
+                 auto=True, bowl=(1, 2)), pick_main=lambda argv: seen.append(argv) or "DRY_RUN")
+        argv = seen[0]
+        self.assertEqual(argv[argv.index("--target") + 1], "foam ring")
+        self.assertIn("--image", argv)
+        for bad in ("--go", "-y", "--place", "--no-show"):
+            self.assertNotIn(bad, argv)
 
     def test_dry_run_never_goes(self):
         seen = []
