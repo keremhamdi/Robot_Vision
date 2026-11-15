@@ -1,0 +1,96 @@
+diff --git a/controller/vision/calibrate_board.py b/controller/vision/calibrate_board.py
+index 6d0c477..8114d21 100644
+--- a/controller/vision/calibrate_board.py
++++ b/controller/vision/calibrate_board.py
+@@ -41,9 +41,10 @@ RESULT: camera.json in the same format the arm page and pick_v4.py use ({"cam",
+ [[u, v, x_cm, y_cm], ...]}), plus calib_check.jpg and an error report. Copy camera.json to the arm
+ project's calib/camera.json. Then check with:   python pick_v4.py --check
+ 
+-Honest accuracy: the script fits the homography on half of the corners and measures the error on the
+-other half. That "held-out" number is what to trust, not the fit error. Under 1 cm is good enough for
+-grasping. If it stays above 1 cm with a flat board and careful touches, the lens (wide angle) is
++Honest accuracy: with TWO or more board positions the script predicts each position from the others
++("between-board-positions error"): that is the number to trust, under 1 cm is good enough for grasping. With ONE
++position it can only report how consistent the corners of that board are with each other, which cannot
++reveal a wrong board placement; it says so and asks for more positions or independent touches. If it stays above 1 cm with a flat board and careful touches, the lens (wide angle) is
+ bending the picture; tell whoever builds on this, a lens correction step is then needed.
+ """
+ import argparse, io, json, math, os, shutil, subprocess, sys, time, urllib.request
+@@ -154,6 +155,24 @@ def evaluate(px_norm, xy):
+     return fit, held
+ 
+ 
++def pose_holdout(px_norm, xy, per_pose):
++    """Leave-one-board-position-out: fit on every OTHER board position, test on this one.
++    All corners of one board position share the same hand-measured placement, so holding out neighbouring
++    corners of the same board cannot reveal a placement error. Holding out a whole position can.
++    Returns the error of every point (cm), or None when there are fewer than two whole positions."""
++    px_norm, xy = np.asarray(px_norm), np.asarray(xy)
++    n = len(xy)
++    if per_pose <= 0 or n % per_pose or n // per_pose < 2:
++        return None
++    out = np.zeros(n)
++    for k in range(n // per_pose):
++        te = np.zeros(n, bool)
++        te[k * per_pose:(k + 1) * per_pose] = True
++        Hk = fit_h(px_norm[~te], xy[~te])
++        out[te] = np.linalg.norm(apply_h(Hk, px_norm[te]) - xy[te], axis=1)
++    return out
++
++
+ # ---------- getting an image ----------
+ 
+ def grab_camera(index, cols, rows):
+@@ -335,6 +354,7 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
+     px = np.array([[p[0], p[1]] for p in pairs]) / w
+     table = np.array([[p[2], p[3]] for p in pairs])
+     fit, held = evaluate(px, table)
++    by_pose = pose_holdout(px, table, cols * rows)
+     if os.path.exists(out_path) and os.path.abspath(append or "") != os.path.abspath(out_path):
+         keep = out_path.replace(".json", "") + time.strftime(".before-%H%M%S.json")
+         shutil.copy(out_path, keep)
+@@ -347,17 +367,32 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
+     H = fit_h(px, table)
+     for (u, v), e in zip(corners, held[-len(corners):]):
+         cv2.circle(vis, (int(u), int(v)), 6, (0, 200, 0) if e < 1 else (0, 0, 255), -1)
+-    msg = f"{len(pairs)} marks  held-out error: mean {held.mean():.2f} max {held.max():.2f} cm"
++    if by_pose is not None:
++        msg = f"{len(pairs)} marks  between-board-positions error: mean {by_pose.mean():.2f} max {by_pose.max():.2f} cm"
++    else:
++        msg = f"{len(pairs)} marks  ONE board position: placement NOT validated"
+     cv2.putText(vis, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 4)
+     cv2.putText(vis, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+     cv2.imwrite(check_path, vis)
+ 
+     print(f"\nWrote {out_path}: {len(pairs)} marks at width {w}px.")
+     print(f"  fit error      mean {fit.mean():.2f} cm, max {fit.max():.2f} cm")
+-    print(f"  held-out error mean {held.mean():.2f} cm, max {held.max():.2f} cm   <- trust this one")
++    print(f"  within-board consistency mean {held.mean():.2f} cm, max {held.max():.2f} cm  "
++          "(corners of the same board position; this does NOT include the error in where the board was placed)")
++    if by_pose is not None:
++        n_pose = len(by_pose) // (cols * rows)
++        for k in range(n_pose):
++            e = by_pose[k * cols * rows:(k + 1) * cols * rows]
++            print(f"  board position {k + 1}: predicted from the OTHER positions, mean {e.mean():.2f} cm, max {e.max():.2f} cm")
++        print(f"  between-board-positions error mean {by_pose.mean():.2f} cm, max {by_pose.max():.2f} cm   <- trust this one")
++    else:
++        print("  ONE board position only: nothing here can reveal an error in where the board was placed or in the arm's own "
++              "readings. Do not treat this as validated. Add at least one more position (--append / --add), or measure a few "
++              "independent points: put the fingertip on marks that are NOT board corners and compare.")
+     hull = cv2.contourArea(cv2.convexHull((px * w).astype(np.float32)))
+     print(f"  the marks cover {100 * hull / (w * h):.0f}% of the picture.")
+-    if held.max() > 1.0:
++    worst = by_pose.max() if by_pose is not None else held.max()
++    if worst > 1.0:
+         print("  -> above 1 cm. Check: board flat? tip exactly on the corners? square size measured? "
+               "Move the board to more places (--append). If it stays high, the lens is bending the picture.")
+     if hull / (w * h) < 0.15:
+@@ -365,7 +400,7 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
+               f"run again with --append {out_path}.")
+     if page and os.path.abspath(out_path) == os.path.abspath(DEFAULT_OUT):
+         reload_page(page)
+-    return held
++    return by_pose if by_pose is not None else held
+ 
+ 
+ def main(argv=None):

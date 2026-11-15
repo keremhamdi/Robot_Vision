@@ -34,9 +34,12 @@ It must be fixed FLAT (tape/glue on cardboard) and one printed square must be me
 6. It saves `board_view.jpg` with corners labelled A (red), B (green), C (blue), D (orange, optional). For each,
    touch the gripper tip exactly on that corner, read the position (`python -m arm.reach where`) and type `x y`
    in cm when asked. (Non-interactive: `--measure A=x,y B=x,y C=x,y [D=x,y]`.)
-7. Move the board to 3-5 other places covering the whole pick area; repeat steps 5-6 each time with
-   `--append camera.json` (it adds the new marks to the file). One position only proves accuracy
-   under the board, not on the far side of the table.
+7. Move the board to 2-4 other places covering the whole pick area (the board should look BIG in the image:
+   a small board far from the camera is located to several pixels, which is about 1 cm); repeat steps 5-6
+   each time with `--append camera.json`. With 2+ positions the script predicts each position from the others
+   and prints "between-board-positions error": that is the number to trust. With ONE position it prints
+   "placement NOT validated": the corners of one board all share the same hand-measured placement, so nothing
+   it reports can reveal an error in where the board was put or in the arm's own readings.
 8. Copy `camera.json` to the arm project's `calib/camera.json` (confirm where the arm page really reads
    its calibration; we could not verify that), then check with `python pick_v4.py --check` if available.
 
@@ -45,9 +48,11 @@ It must be fixed FLAT (tape/glue on cardboard) and one printed square must be me
   the board (wrong `--square-cm`, wrong corner touched, corners swapped, typo). Fix the inputs. Do NOT use
   `--force` and do NOT loosen the refusal thresholds to make it pass: a wrong calibration looks perfect in the
   "held-out error" number, because that only measures consistency, not whether the touches were right.
-- Trust the "held-out error" only after the touches pass. Under 1 cm is good for grasping. If it stays above
-  1 cm with a flat board and careful touches, the wide-angle lens is probably bending the picture and a lens
-  correction step is needed (not built yet).
+- Trust the "between-board-positions error" (2+ board positions), and only after the touches pass. Under 1 cm is
+  good for grasping. A single board position can only show "within-board consistency", which looks excellent
+  (0.0x cm) even when the placement is 1-2 cm wrong: confirm with independent points (fingertip on marks that are
+  NOT board corners, compared with what the calibration predicts). If it stays above 1 cm with a flat board and
+  careful touches, the lens (wide angle) or the arm's own position readings are the likely cause.
 - Warn about low coverage ("marks cover a small part of the picture"): add more board positions.
 - Report back honestly what ran and what did not. Not tested by the author: a real arm, the real standing
   camera, and whether `arm.reach where` coordinates equal the arm page's x, y.
@@ -91,9 +96,10 @@ RESULT: camera.json in the same format the arm page and pick_v4.py use ({"cam", 
 [[u, v, x_cm, y_cm], ...]}), plus calib_check.jpg and an error report. Copy camera.json to the arm
 project's calib/camera.json. Then check with:   python pick_v4.py --check
 
-Honest accuracy: the script fits the homography on half of the corners and measures the error on the
-other half. That "held-out" number is what to trust, not the fit error. Under 1 cm is good enough for
-grasping. If it stays above 1 cm with a flat board and careful touches, the lens (wide angle) is
+Honest accuracy: with TWO or more board positions the script predicts each position from the others
+("between-board-positions error"): that is the number to trust, under 1 cm is good enough for grasping. With ONE
+position it can only report how consistent the corners of that board are with each other, which cannot
+reveal a wrong board placement; it says so and asks for more positions or independent touches. If it stays above 1 cm with a flat board and careful touches, the lens (wide angle) is
 bending the picture; tell whoever builds on this, a lens correction step is then needed.
 """
 import argparse, io, json, math, os, sys
@@ -200,6 +206,24 @@ def evaluate(px_norm, xy):
         Hk = fit_h(px_norm[tr], xy[tr])
         held[~tr] = np.linalg.norm(apply_h(Hk, px_norm[~tr]) - xy[~tr], axis=1)
     return fit, held
+
+
+def pose_holdout(px_norm, xy, per_pose):
+    """Leave-one-board-position-out: fit on every OTHER board position, test on this one.
+    All corners of one board position share the same hand-measured placement, so holding out neighbouring
+    corners of the same board cannot reveal a placement error. Holding out a whole position can.
+    Returns the error of every point (cm), or None when there are fewer than two whole positions."""
+    px_norm, xy = np.asarray(px_norm), np.asarray(xy)
+    n = len(xy)
+    if per_pose <= 0 or n % per_pose or n // per_pose < 2:
+        return None
+    out = np.zeros(n)
+    for k in range(n // per_pose):
+        te = np.zeros(n, bool)
+        te[k * per_pose:(k + 1) * per_pose] = True
+        Hk = fit_h(px_norm[~te], xy[~te])
+        out[te] = np.linalg.norm(apply_h(Hk, px_norm[te]) - xy[te], axis=1)
+    return out
 
 
 # ---------- getting an image ----------
@@ -323,6 +347,7 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
     px = np.array([[p[0], p[1]] for p in pairs]) / w
     table = np.array([[p[2], p[3]] for p in pairs])
     fit, held = evaluate(px, table)
+    by_pose = pose_holdout(px, table, cols * rows)
     with open(out_path, "w") as fh:
         json.dump({"cam": 0, "size": w, "pairs": pairs}, fh, indent=1)
 
@@ -330,23 +355,38 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
     H = fit_h(px, table)
     for (u, v), e in zip(corners, held[-len(corners):]):
         cv2.circle(vis, (int(u), int(v)), 6, (0, 200, 0) if e < 1 else (0, 0, 255), -1)
-    msg = f"{len(pairs)} marks  held-out error: mean {held.mean():.2f} max {held.max():.2f} cm"
+    if by_pose is not None:
+        msg = f"{len(pairs)} marks  between-board-positions error: mean {by_pose.mean():.2f} max {by_pose.max():.2f} cm"
+    else:
+        msg = f"{len(pairs)} marks  ONE board position: placement NOT validated"
     cv2.putText(vis, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 4)
     cv2.putText(vis, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
     cv2.imwrite(check_path, vis)
 
     print(f"\nWrote {out_path}: {len(pairs)} marks at width {w}px.")
     print(f"  fit error      mean {fit.mean():.2f} cm, max {fit.max():.2f} cm")
-    print(f"  held-out error mean {held.mean():.2f} cm, max {held.max():.2f} cm   <- trust this one")
+    print(f"  within-board consistency mean {held.mean():.2f} cm, max {held.max():.2f} cm  "
+          "(corners of the same board position; this does NOT include the error in where the board was placed)")
+    if by_pose is not None:
+        n_pose = len(by_pose) // (cols * rows)
+        for k in range(n_pose):
+            e = by_pose[k * cols * rows:(k + 1) * cols * rows]
+            print(f"  board position {k + 1}: predicted from the OTHER positions, mean {e.mean():.2f} cm, max {e.max():.2f} cm")
+        print(f"  between-board-positions error mean {by_pose.mean():.2f} cm, max {by_pose.max():.2f} cm   <- trust this one")
+    else:
+        print("  ONE board position only: nothing here can reveal an error in where the board was placed or in the arm's own "
+              "readings. Do not treat this as validated. Add at least one more position (--append / --add), or measure a few "
+              "independent points: put the fingertip on marks that are NOT board corners and compare.")
     hull = cv2.contourArea(cv2.convexHull((px * w).astype(np.float32)))
     print(f"  the marks cover {100 * hull / (w * h):.0f}% of the picture.")
-    if held.max() > 1.0:
+    worst = by_pose.max() if by_pose is not None else held.max()
+    if worst > 1.0:
         print("  -> above 1 cm. Check: board flat? tip exactly on the corners? square size measured? "
               "Move the board to more places (--append). If it stays high, the lens is bending the picture.")
     if hull / (w * h) < 0.15:
         print("  -> the marks cover a small part of the picture. Move the board around the pick area and "
               f"run again with --append {out_path}.")
-    return held
+    return by_pose if by_pose is not None else held
 
 
 def main(argv=None):

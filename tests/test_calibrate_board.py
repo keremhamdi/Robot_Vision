@@ -185,6 +185,7 @@ class Calibrate(unittest.TestCase):
         class FakeCap:
             def __init__(self, i): pass
             def isOpened(self): return True
+            def set(self, *a): return True          # the friend's version sets MJPG / resolution
             def read(self):
                 seq["n"] += 1
                 return True, (blank if seq["n"] < 4 else board_frame)
@@ -202,6 +203,61 @@ class Calibrate(unittest.TestCase):
             cv2.VideoCapture, cv2.imshow, cv2.waitKey, cv2.destroyAllWindows = saved
         self.assertEqual(seq["n"], 4)            # blank frames were skipped; the first frame with the board was taken
         self.assertTrue((frame == board_frame).all())
+
+    # A camera that fills the frame (24 px per cm, board ~600 px wide). The default test camera is so oblique
+    # that the board is a sliver whose corners are located to several pixels (about 1 cm): a real effect, but
+    # it would hide what these tests are about.
+    NEAR = np.array([[24.0, 1.0, 640.0], [0.6, 24.0, -516.0], [0.0001, 0.0003, 1.0]])
+
+    def _positions(self, n, bad_cm):
+        """n board positions; the last one has a placement error `bad_cm` (far corners touched sideways),
+        small enough that the touch check does not refuse it."""
+        import io, contextlib
+        global H_TRUE
+        layouts = [(-8, 25, 0), (2, 32, 10), (-6, 36, -8)][:n]
+        saved, H_TRUE = H_TRUE, self.NEAR
+        try:
+            rng = np.random.default_rng(4)
+            d = tempfile.mkdtemp(); out = os.path.join(d, "camera.json")
+            buf = io.StringIO(); res = None
+            for k, (x0, y0, th) in enumerate(layouts):
+                img = os.path.join(d, f"t{k}.png")
+                render(x0, y0, th, False, img, rng)
+                m = self.touch(img, rng, 0.1)
+                if k == n - 1 and bad_cm:
+                    for nn in ("B", "D"):
+                        m[nn] = (m[nn][0], m[nn][1] + bad_cm)
+                with contextlib.redirect_stdout(buf):
+                    res = CB.calibrate(cv2.imread(img), COLS, ROWS, SQ, m, out, os.path.join(d, "v.jpg"),
+                                       os.path.join(d, "c.jpg"), append=out if k else None)
+            return res, buf.getvalue()
+        finally:
+            H_TRUE = saved
+
+    def test_between_position_error_catches_a_bad_placement(self):
+        for n in (2, 3):
+            good, _ = self._positions(n, 0.0)
+            bad, text_bad = self._positions(n, 1.2)
+            self.assertLess(good.max(), 0.5, f"{n} positions, good placement")
+            self.assertGreater(bad.max(), 1.0, f"{n} positions, 1.2 cm placement error must be visible")
+            self.assertIn("between-board-positions error", text_bad)
+            self.assertIn("-> above 1 cm", text_bad)
+
+    def test_single_position_is_not_called_validated(self):
+        import io, contextlib
+        rng = np.random.default_rng(1)
+        d = tempfile.mkdtemp(); img = os.path.join(d, "t.png")
+        render(-6, 26, 12, False, img, rng)
+        m = self.touch(img, rng, 0.05)
+        m["B"] = (m["B"][0], m["B"][1] + 1.2); m["D"] = (m["D"][0], m["D"][1] + 1.2)   # placement error, invisible within one board
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            CB.calibrate(cv2.imread(img), COLS, ROWS, SQ, m, os.path.join(d, "o.json"),
+                         os.path.join(d, "v.jpg"), os.path.join(d, "c.jpg"))
+        text = buf.getvalue()
+        self.assertIn("ONE board position only", text)
+        self.assertIn("does NOT include the error in where the board was placed", text)
+        self.assertNotIn("<- trust this one", text.split("within-board")[0])
 
     def test_missing_board_exits(self):
         blank = np.full((H, W, 3), 128, np.uint8)
