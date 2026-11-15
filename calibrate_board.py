@@ -20,10 +20,12 @@ STEP 2 - run (pick ONE way to get the camera image):
     python calibrate_board.py --camera 0 --square-cm 2.5          # direct from the camera (press SPACE)
     python calibrate_board.py --page http://localhost:8890 --square-cm 2.5   # same image the arm page uses
     python calibrate_board.py --image photo.jpg --square-cm 2.5   # a saved photo from that camera
-  The script finds the corners and saves board_view.jpg with three corners labelled A (red), B (green)
-  and C (blue). Then, for each of A, B, C: move the gripper tip until it touches that exact corner and
+  The script finds the corners and saves board_view.jpg with corners labelled A (red), B (green),
+  C (blue) and an optional far corner D (orange). Then, for each of A, B, C: move the gripper tip until it touches that exact corner and
   read its position (python -m arm.reach where), and type "x y" in cm when asked.
-  (Non-interactive: add  --measure A=x,y B=x,y C=x,y .)
+  (Non-interactive: add  --measure A=x,y B=x,y C=x,y [D=x,y] .)
+  If the three touches do not fit a board of this size, the script REFUSES to write camera.json and says
+  why (wrong --square-cm, wrong corner touched, corners swapped). --force overrides it; do not.
 
 STEP 3 - move the board to another place in the pick area and run again with --append camera.json.
   3 to 5 positions covering the whole area (corners and middle) is much better than one.
@@ -78,7 +80,8 @@ def detect(gray, cols, rows):
 def label_view(img, corners, cols, rows, path):
     vis = img.copy()
     cv2.drawChessboardCorners(vis, (cols, rows), corners.reshape(-1, 1, 2).astype(np.float32), True)
-    marks = {"A": (0, 0, (0, 0, 255)), "B": (cols - 1, 0, (0, 200, 0)), "C": (0, rows - 1, (255, 0, 0))}
+    marks = {"A": (0, 0, (0, 0, 255)), "B": (cols - 1, 0, (0, 200, 0)), "C": (0, rows - 1, (255, 0, 0)),
+             "D": (cols - 1, rows - 1, (0, 180, 255))}
     for name, (c, r, col) in marks.items():
         p = tuple(int(round(v)) for v in corners[r * cols + c])
         cv2.circle(vis, p, 14, col, 3)
@@ -155,16 +158,16 @@ def grab_camera(index, cols, rows):
         if not ok:
             sys.exit("Camera gave no image.")
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(g, None, fx=0.5, fy=0.5)
-        found = detect(small, cols, rows) is not None
+        k = min(1.0, 1280.0 / g.shape[1])        # a small-looking board needs the resolution; this is still fast
+        found = detect(cv2.resize(g, None, fx=k, fy=k) if k < 1 else g, cols, rows) is not None
         vis = frame.copy()
         cv2.putText(vis, "FOUND - press SPACE" if found else "board not found", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0) if found else (0, 0, 255), 2)
         cv2.imshow("calibrate_board", vis)
-        k = cv2.waitKey(30) & 0xFF
-        if k == ord("q"):
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord("q"):
             sys.exit("Cancelled.")
-        if k == ord(" ") and found:
+        if key == ord(" ") and found:
             cap.release(); cv2.destroyAllWindows()
             return frame
 
@@ -180,10 +183,13 @@ def grab_page(url):
 
 # ---------- main ----------
 
-def ask_xy(name):
+def ask_xy(name, optional=False):
     while True:
+        raw = input(f"  corner {name}: arm x y in cm (e.g. -12.5 30.2): ").replace(",", " ").split()
+        if optional and not raw:
+            return None
         try:
-            x, y = [float(v) for v in input(f"  corner {name}: arm x y in cm (e.g. -12.5 30.2): ").replace(",", " ").split()]
+            x, y = [float(v) for v in raw]
             return x, y
         except ValueError:
             print("  type two numbers, like:  -12.5 30.2")
@@ -198,7 +204,11 @@ def parse_measure(items):
     return out
 
 
-def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, append=None):
+TOUCH_REFUSE_CM = 1.5  # touches disagreeing with the board by more than this = a mistake: refuse to write
+TOUCH_WARN_CM = 0.6    # between this and the above: write it, but say the touches were loose
+
+
+def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, append=None, force=False):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     corners = detect(gray, cols, rows)
     if corners is None:
@@ -206,24 +216,43 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
                  "and are --cols/--rows the number of INNER corners (squares minus one)?")
     h, w = gray.shape
     marks = label_view(img, corners, cols, rows, view_path)
-    print(f"Found {len(corners)} corners. Look at {view_path}: A = red, B = green, C = blue.")
+    print(f"Found {len(corners)} corners. Look at {view_path}: A = red, B = green, C = blue, D = orange (optional).")
     if not measure:
         print("Touch the gripper tip to each labelled corner and read its position (python -m arm.reach where):")
         measure = {n: ask_xy(n) for n in "ABC"}
-    meas = [(marks[n][0], marks[n][1], measure[n][0], measure[n][1]) for n in "ABC" if n in measure]
-    if len(meas) < 3:
-        sys.exit("Need all three corners A, B and C.")
+        d_xy = ask_xy("D (far corner, optional - just press Enter to skip)", optional=True)
+        if d_xy:
+            measure["D"] = d_xy
+    meas = [(marks[n][0], marks[n][1], measure[n][0], measure[n][1]) for n in "ABCD" if n in measure]
+    if not all(n in measure for n in "ABC"):
+        sys.exit("Need at least the three corners A, B and C.")
 
     # sanity checks on the touches (are they consistent with a board of this size?)
     (a, b, c) = [np.array(m[2:]) for m in meas[:3]]
     problems = []
-    if abs(np.linalg.norm(b - a) - (cols - 1) * sq) > 0.5:
+    if abs(np.linalg.norm(b - a) - (cols - 1) * sq) > TOUCH_REFUSE_CM:
         problems.append(f"A to B is {np.linalg.norm(b - a):.1f} cm but should be {(cols - 1) * sq:.1f} cm")
-    if abs(np.linalg.norm(c - a) - (rows - 1) * sq) > 0.5:
+    if abs(np.linalg.norm(c - a) - (rows - 1) * sq) > TOUCH_REFUSE_CM:
         problems.append(f"A to C is {np.linalg.norm(c - a):.1f} cm but should be {(rows - 1) * sq:.1f} cm")
     f, res, mirrored = fit_board_to_arm(meas, sq)
-    print(f"Touch check: your 3 measurements agree with the board to within {res.max():.2f} cm"
-          + (" (board axes mirrored in the arm frame: normal)" if mirrored else "") + ".")
+    if res.max() > TOUCH_REFUSE_CM:
+        problems.append(f"the three touched corners do not fit a board of this size (off by up to {res.max():.1f} cm)")
+    if problems:
+        print("\nPROBLEM with the touched corners (the picture itself is fine):")
+        for p_ in problems:
+            print("  -", p_)
+        print("  Likely causes: wrong --square-cm (measure one square again), the tip was not exactly on the corner "
+              "labelled A/B/C in the picture, or two corners were swapped.")
+        if not force:
+            sys.exit("Nothing was written. Fix the numbers and run again (or add --force to write it anyway).")
+        print("  --force given: writing it anyway. Do not trust this calibration.")
+    else:
+        print(f"Touch check OK: your {len(meas)} measurements fit the board to within {res.max():.2f} cm"
+              + (" (board axes mirrored in the arm frame: normal)." if mirrored else "."))
+        if res.max() > TOUCH_WARN_CM:
+            print(f"  Note: the touches are a bit loose ({res.max():.1f} cm). This limits the accuracy of this board "
+                  "position, because a small error in where the board lies tilts the whole map. For a better result: "
+                  "touch the corners more carefully, add the optional far corner D, and use several board positions.")
 
     xy = np.array([f(i % cols, i // cols) for i in range(len(corners))])
     pairs = [[float(u), float(v), float(x), float(y)] for (u, v), (x, y) in zip(corners, xy)]
@@ -254,8 +283,6 @@ def calibrate(img, cols, rows, sq, measure, out_path, view_path, check_path, app
     print(f"  held-out error mean {held.mean():.2f} cm, max {held.max():.2f} cm   <- trust this one")
     hull = cv2.contourArea(cv2.convexHull((px * w).astype(np.float32)))
     print(f"  the marks cover {100 * hull / (w * h):.0f}% of the picture.")
-    for p in problems:
-        print("  WARNING:", p, "(wrong --square-cm, or the tip was not on that corner)")
     if held.max() > 1.0:
         print("  -> above 1 cm. Check: board flat? tip exactly on the corners? square size measured? "
               "Move the board to more places (--append). If it stays high, the lens is bending the picture.")
@@ -275,7 +302,8 @@ def main(argv=None):
     src.add_argument("--camera", type=int, help="camera index (0, 1, ...)")
     src.add_argument("--page", help="the arm page, e.g. http://localhost:8890 (uses its /frame.jpg)")
     src.add_argument("--image", help="a saved photo from the same camera")
-    ap.add_argument("--measure", nargs="*", metavar="A=x,y", help="arm positions of corners A B C (skip typing)")
+    ap.add_argument("--measure", nargs="*", metavar="A=x,y", help="arm positions of corners A B C (and optionally D); skips typing")
+    ap.add_argument("--force", action="store_true", help="write camera.json even if the touches do not fit the board")
     ap.add_argument("--append", metavar="camera.json", help="add this board position to an existing file")
     ap.add_argument("--out", default="camera.json")
     ap.add_argument("--view", default="board_view.jpg")
@@ -299,7 +327,7 @@ def main(argv=None):
     else:
         ap.error("choose one of --camera, --page, --image")
     calibrate(img, a.cols, a.rows, a.square_cm, parse_measure(a.measure or []), a.out, a.view, a.check_img,
-              a.append)
+              a.append, a.force)
 
 
 if __name__ == "__main__":
