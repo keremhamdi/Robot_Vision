@@ -4,7 +4,11 @@ Status as of 2026-11-15, checked against the repo (`keremhamdi/Robot_Vision`, on
 Nothing was executed here: the sandbox has no torch, cv2, arm or camera. Everything below comes from reading the code and the saved eval CSVs.
 
 ## Key finding
-**This repo is the vision side only.** Your friend's arm code (LosPollosForTheElders, `arm/click.py`, `arm/reach.py`) is **not in it**. `pick_v4.py` talks to his code over HTTP, so the two repos stay separate. Attach or clone LosPollosForTheElders if you want its parts verified too.
+**This repo is the vision side only.** `pick_v4.py` talks over HTTP (`/status`, `/frame.jpg`, `/api/grab`) to an arm page (`arm/click.py`) that is **not in this repo**.
+
+**Correction (2026-11-15):** `LosPollosForTheElders` is the **Reachy Mini** app (Medicine Buddy), not the arm code. It contains no `arm/click.py`. It talks to the arm only through the `medicine_buddy.arm.v1` HTTP contract (`POST /v1/dispense`, `/v1/check_taken`), and the arm side there is still fake. Which repo holds the `arm.click` page is still to confirm.
+
+**Combining them:** `arm_service.py` (this repo) is the arm-side server for that contract. It maps the medicine name to an object in `items_v1.json`, runs `pick_v4`, and answers in the format Reachy expects. On Reachy only `MEDICINE_BUDDY_ARM_URL=http://<mac>:9090` changes, and the app's forced dry-run must be switched off. See `arm_service.py` for the details and `tests/test_arm_service.py` for the checks.
 
 ## What exists (verified in code)
 | Part | State |
