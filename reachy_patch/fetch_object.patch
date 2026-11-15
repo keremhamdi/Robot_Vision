@@ -1,0 +1,375 @@
+diff --git a/apps/medicine_buddy/medicine_buddy/api.py b/apps/medicine_buddy/medicine_buddy/api.py
+index 5b3ba6d..41a3484 100644
+--- a/apps/medicine_buddy/medicine_buddy/api.py
++++ b/apps/medicine_buddy/medicine_buddy/api.py
+@@ -592,6 +592,63 @@ class MedicineBuddyService(
+             "speak_hint": speak_hint,
+         }
+ 
++    def fetch_object(self, body: dict[str, Any]) -> dict[str, Any]:
++        """Bring a household object (not a medicine) via the arm PC. Same confirm-first rule as dispense."""
++        name = str(body.get("object") or "").strip()
++        if not name:
++            return {"error": "Which object should I bring?", "speak_hint": "Ask which object they want."}
++        confirmed = bool(body.get("confirmed", False))
++        remote = HttpArmClient.from_config(self.config)
++        if remote is None:
++            return {
++                "error": "arm not connected",
++                "speak_hint": "I can't reach the arm computer right now. Please ask someone to check it.",
++            }
++        with self._lock:
++            key = f"fetch:{name.lower()}"
++            if confirmed and self.guard.enabled and not self.guard.has_pending(key):
++                confirmed = False  # the AI didn't ask first: ask now instead of acting
++            if confirmed:
++                blocked = self.guard.require_yes("fetch", key)
++                if blocked:
++                    return blocked
++            if not confirmed:
++                self.guard.ask(key)
++                return {
++                    "status": "needs_confirm",
++                    "object": name,
++                    "speak_hint": (
++                        f"Should I bring you the {name}? "
++                        "If they say yes, call fetch_object again with confirmed=true."
++                    ),
++                }
++            try:
++                result = remote.fetch(object_name=name)
++            except RuntimeError as exc:
++                return {
++                    "status": "error",
++                    "error": str(exc),
++                    "speak_hint": "I can't reach the arm computer right now.",
++                }
++        if result.ok and result.final_state == "placed":
++            demo = self.config.dry_run
++            hint = (
++                f"Demo mode: I found the {name} but the arm did not move."
++                if demo
++                else f"The {name} is ready for you."
++            )
++        else:
++            hint = f"Sorry, I could not bring the {name}. {result.error or result.detect_detail}".strip()
++        return {
++            "status": "ok" if result.ok else "failed",
++            "final_state": result.final_state,
++            "object": name,
++            "label": result.label,
++            "demo_mode": self.config.dry_run,
++            "detail": result.detect_detail,
++            "speak_hint": hint,
++        }
++
+     def mark_adherence(self, body: dict[str, Any]) -> dict[str, Any]:
+         taken = body.get("taken")
+         if taken is None:
+@@ -805,6 +862,7 @@ def make_handler(service: MedicineBuddyService) -> type[BaseHTTPRequestHandler]:
+         "/schedules/delete": service.delete_schedule,
+         "/doses/run": service.run_dose,
+         "/doses/adherence": service.mark_adherence,
++        "/arm/fetch": service.fetch_object,
+         "/voice/heard": service.voice_heard,  # loopback only, see _post
+         "/voice/listen_mode": service.listen_mode,  # loopback only — patient story listening
+         "/medicines/list": service.list_medicines,
+diff --git a/apps/medicine_buddy/medicine_buddy/arm_protocol.py b/apps/medicine_buddy/medicine_buddy/arm_protocol.py
+index 06e58c5..9e49254 100644
+--- a/apps/medicine_buddy/medicine_buddy/arm_protocol.py
++++ b/apps/medicine_buddy/medicine_buddy/arm_protocol.py
+@@ -19,6 +19,7 @@ from typing import Any
+ SCHEMA = "medicine_buddy.arm.v1"
+ DISPENSE_PATH = "/v1/dispense"
+ CHECK_TAKEN_PATH = "/v1/check_taken"
++FETCH_PATH = "/v1/fetch"
+ 
+ FINAL_STATES = frozenset({"placed", "failed", "aborted"})
+ 
+@@ -147,6 +148,61 @@ class CheckTakenResult:
+         )
+ 
+ 
++@dataclass(frozen=True)
++class FetchCommand:
++    """Bring any known household object (not a medicine) to the person's hand-over spot."""
++
++    request_id: str
++    object_name: str
++    deliver_to: str = "handover"
++    one_shot_detect: bool = True
++    dry_run: bool = False
++    schema: str = SCHEMA
++    message_type: str = "fetch"
++
++    def to_json(self) -> str:
++        payload = {
++            "schema": self.schema,
++            "message_type": self.message_type,
++            "request_id": self.request_id,
++            "object": self.object_name,
++            "deliver_to": self.deliver_to,
++            "one_shot_detect": self.one_shot_detect,
++            "dry_run": self.dry_run,
++        }
++        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
++
++
++@dataclass(frozen=True)
++class FetchResult:
++    request_id: str
++    ok: bool
++    final_state: str
++    label: str | None = None
++    place_verified: bool = False
++    detect_detail: str = ""
++    error: str | None = None
++    schema: str = SCHEMA
++    message_type: str = "fetch_result"
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any], *, fallback_request_id: str = "") -> "FetchResult":
++        state = str(data.get("final_state") or ("placed" if data.get("ok") else "failed")).lower()
++        if state not in FINAL_STATES:
++            state = "failed"
++        return cls(
++            request_id=str(data.get("request_id") or fallback_request_id),
++            ok=bool(data.get("ok")),
++            final_state=state,
++            label=(str(data["label"]) if data.get("label") is not None else None),
++            place_verified=bool(data.get("place_verified")),
++            detect_detail=str(data.get("detect_detail") or data.get("error") or ""),
++            error=(str(data["error"]) if data.get("error") is not None else None),
++            schema=str(data.get("schema") or SCHEMA),
++            message_type=str(data.get("message_type") or "fetch_result"),
++        )
++
++
+ def new_request_id() -> str:
+     return str(uuid.uuid4())
+ 
+diff --git a/apps/medicine_buddy/medicine_buddy/conversation/external_profiles/medicine_caregiver/profile.md b/apps/medicine_buddy/medicine_buddy/conversation/external_profiles/medicine_caregiver/profile.md
+index 98d09cc..5fececa 100644
+--- a/apps/medicine_buddy/medicine_buddy/conversation/external_profiles/medicine_caregiver/profile.md
++++ b/apps/medicine_buddy/medicine_buddy/conversation/external_profiles/medicine_caregiver/profile.md
+@@ -16,6 +16,7 @@ default_tools = [
+   "list_medicines",
+   "check_due_medicines",
+   "dispense_medicine",
++  "fetch_object",
+   "mark_dose_taken",
+   "start_family_call",
+   "suggest_activity",
+@@ -66,6 +67,12 @@ You are a calm, warm home companion for an older adult and their family. You hel
+ - Use `dance` when they ask to dance or celebrate something joyful; `stop_dance` / `stop_emotion` when they ask to stop.
+ - Never delay a medicine or safety tool to play an emotion first.
+ 
++## Fetching things with the arm
++
++- When the person asks for an everyday object ("give me the water bottle"), ask "Should I bring you the {object}?" and only call `fetch_object` with `confirmed=true` after a clear yes. Medicines use `dispense_medicine`, never this tool.
++- Say the object as they said it. If the tool says it could not find or bring it, read its `speak_hint`; do not promise it will work next time.
++- Never fetch anything for safety-critical reasons (no sharp objects, hot items, or things to lift a person).
++
+ ## Medicine rules
+ 
+ - Never give medical advice, dosages, or diagnose.
+diff --git a/apps/medicine_buddy/medicine_buddy/conversation/external_tools/fetch_object.py b/apps/medicine_buddy/medicine_buddy/conversation/external_tools/fetch_object.py
+new file mode 100644
+index 0000000..6c22a62
+--- /dev/null
++++ b/apps/medicine_buddy/medicine_buddy/conversation/external_tools/fetch_object.py
+@@ -0,0 +1,53 @@
++"""External tool: ask the arm to bring a household object after the person confirms."""
++
++from __future__ import annotations
++
++import importlib.util
++import logging
++from pathlib import Path
++from typing import Any
++
++from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
++
++logger = logging.getLogger(__name__)
++
++
++def _api_request(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
++    helper = Path(__file__).resolve().parent.parent / "lib" / "tool_http.py"
++    spec = importlib.util.spec_from_file_location("medicine_tool_http", helper)
++    if spec is None or spec.loader is None:
++        return {"error": f"missing helper {helper}"}
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod.api_request(method, path, body)
++
++
++class FetchObject(Tool):
++    name = "fetch_object"
++    description = (
++        "Ask the arm to bring an everyday object (for example the water bottle) to the person. "
++        "Ask first: 'Should I bring you the {object}?' and only call with confirmed=true after "
++        "they say yes. Use dispense_medicine for medicines, not this tool. Pass the object as the "
++        "person said it; the arm only knows a short fixed list and will say if it cannot find it."
++    )
++    parameters_schema = {
++        "type": "object",
++        "properties": {
++            "object": {"type": "string", "description": "Object to bring, e.g. 'water bottle'"},
++            "confirmed": {
++                "type": "boolean",
++                "description": "True only after the person agreed to bring it",
++            },
++        },
++        "required": ["object", "confirmed"],
++    }
++
++    async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
++        del deps
++        payload = _api_request(
++            "POST",
++            "/arm/fetch",
++            {"object": kwargs.get("object"), "confirmed": bool(kwargs.get("confirmed", False))},
++        )
++        logger.info("fetch_object -> %s", payload)
++        return payload
+diff --git a/apps/medicine_buddy/medicine_buddy/http_arm.py b/apps/medicine_buddy/medicine_buddy/http_arm.py
+index a15311f..626f113 100644
+--- a/apps/medicine_buddy/medicine_buddy/http_arm.py
++++ b/apps/medicine_buddy/medicine_buddy/http_arm.py
+@@ -11,10 +11,13 @@ from urllib.parse import urljoin, urlparse
+ from medicine_buddy.arm_protocol import (
+     CHECK_TAKEN_PATH,
+     DISPENSE_PATH,
++    FETCH_PATH,
+     CheckTakenCommand,
+     CheckTakenResult,
+     DispenseCommand,
+     DispenseResult,
++    FetchCommand,
++    FetchResult,
+     MedicineRef,
+     new_request_id,
+     parse_json_body,
+@@ -98,6 +101,26 @@ class HttpArmClient:
+         )
+         return result
+ 
++    def fetch(
++        self,
++        *,
++        object_name: str,
++        deliver_to: str = "handover",
++        request_id: str | None = None,
++    ) -> FetchResult:
++        """Ask the arm PC to bring a known household object (water bottle, glasses case...)."""
++        rid = request_id or new_request_id()
++        cmd = FetchCommand(
++            request_id=rid, object_name=object_name, deliver_to=deliver_to, dry_run=self.dry_run
++        )
++        raw = self._post(FETCH_PATH, cmd.to_json())
++        result = FetchResult.from_dict(raw, fallback_request_id=rid)
++        logger.info(
++            "arm fetch_result request_id=%s ok=%s state=%s object=%s",
++            result.request_id, result.ok, result.final_state, object_name,
++        )
++        return result
++
+     def check_taken(
+         self,
+         *,
+diff --git a/apps/medicine_buddy/medicine_buddy/main.py b/apps/medicine_buddy/medicine_buddy/main.py
+index e038e2e..ddb4bd3 100644
+--- a/apps/medicine_buddy/medicine_buddy/main.py
++++ b/apps/medicine_buddy/medicine_buddy/main.py
+@@ -137,9 +137,10 @@ class MedicineBuddy(ReachyMiniApp):
+         port = int(os.environ.get("MEDICINE_BUDDY_PORT", "8787"))
+         guard = os.environ.get("MEDICINE_BUDDY_VOICE_GUARD", "1").lower() not in {"0", "false", "no", "off"}
+         db_path = default_db_path()
+-        # dry_run stays true until arm URL is live; ARM_URL enables structured HTTP arm.v1 signals.
++        # dry_run defaults to true; set MEDICINE_BUDDY_DRY_RUN=0 (and MEDICINE_BUDDY_ARM_URL) so the
++        # arm really moves. Before this change it was forced on here.
+         service, server, _ = start_server(
+-            host, port, db_path, load_app_config(dry_run=True), voice_guard=guard,
++            host, port, db_path, load_app_config(), voice_guard=guard,
+         )
+         _SERVICE = service
+         _install_transcript_hook()
+diff --git a/apps/medicine_buddy/tests/test_fetch_object.py b/apps/medicine_buddy/tests/test_fetch_object.py
+new file mode 100644
+index 0000000..9f9b0d7
+--- /dev/null
++++ b/apps/medicine_buddy/tests/test_fetch_object.py
+@@ -0,0 +1,73 @@
++"""fetch_object: confirm first, then ask the arm PC over arm.v1 /v1/fetch."""
++from __future__ import annotations
++
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from pathlib import Path
++
++from medicine_buddy.api import MedicineBuddyService
++from medicine_buddy.arm_protocol import FetchCommand, FetchResult
++from medicine_buddy.config import AppConfig
++
++
++def _arm(reply: dict):
++    seen: list[dict] = []
++
++    class H(BaseHTTPRequestHandler):
++        def do_POST(self):  # noqa: N802
++            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++            seen.append({"path": self.path, **body})
++            data = json.dumps({**reply, "request_id": body["request_id"]}).encode()
++            self.send_response(200)
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def log_message(self, *a):  # noqa: D401
++            pass
++
++    srv = HTTPServer(("127.0.0.1", 0), H)
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    return srv, f"http://127.0.0.1:{srv.server_address[1]}", seen
++
++
++def test_protocol_roundtrip() -> None:
++    cmd = FetchCommand(request_id="r", object_name="water bottle")
++    assert json.loads(cmd.to_json())["object"] == "water bottle"
++    res = FetchResult.from_dict({"ok": True, "final_state": "placed", "label": "water bottle"})
++    assert res.ok and res.final_state == "placed"
++    assert FetchResult.from_dict({"ok": False, "final_state": "weird"}).final_state == "failed"
++
++
++def test_fetch_asks_first_then_calls_arm(tmp_path: Path) -> None:
++    srv, url, seen = _arm({"ok": True, "final_state": "placed", "label": "water bottle"})
++    try:
++        service = MedicineBuddyService(tmp_path / "f.db", AppConfig(dry_run=False, arm_url=url))
++        first = service.fetch_object({"object": "water bottle", "confirmed": False})
++        assert first["status"] == "needs_confirm" and seen == []
++        done = service.fetch_object({"object": "water bottle", "confirmed": True})
++        assert done["status"] == "ok" and "ready" in done["speak_hint"]
++        assert seen[0]["path"] == "/v1/fetch" and seen[0]["object"] == "water bottle"
++        assert seen[0]["dry_run"] is False
++        service.close()
++    finally:
++        srv.shutdown()
++
++
++def test_fetch_failure_is_spoken(tmp_path: Path) -> None:
++    srv, url, _ = _arm({"ok": False, "final_state": "failed", "error": "object not found on the table"})
++    try:
++        service = MedicineBuddyService(tmp_path / "f.db", AppConfig(dry_run=False, arm_url=url))
++        service.fetch_object({"object": "water bottle", "confirmed": False})
++        r = service.fetch_object({"object": "water bottle", "confirmed": True})
++        assert r["status"] == "failed" and "not found" in r["speak_hint"]
++        service.close()
++    finally:
++        srv.shutdown()
++
++
++def test_no_arm_url_is_a_clear_error(tmp_path: Path) -> None:
++    service = MedicineBuddyService(tmp_path / "f.db", AppConfig(dry_run=False))
++    assert "arm computer" in service.fetch_object({"object": "water bottle", "confirmed": True})["speak_hint"]
++    service.close()

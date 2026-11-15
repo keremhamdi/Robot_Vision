@@ -82,6 +82,36 @@ class Dispense(unittest.TestCase):
             srv.shutdown()
         self.assertFalse(r["ok"]); self.assertIn("cuda exploded", r["error"])
 
+    def run_fetch(self, said, status="PLACED", dry=False, handover=(0, 30), bowl=None):
+        calls = []
+        def runner(argv):
+            calls.append(argv); return status
+        srv, base = serve(S.Service(ITEMS, "http://x", "none", bowl, runner=runner, handover=handover,
+                                    out_dir="/tmp/arm_service_test"))
+        try:
+            return self.post(base, "/v1/fetch", {"schema": S.SCHEMA, "request_id": "f1", "object": said,
+                                                 "dry_run": dry}), calls
+        finally:
+            srv.shutdown()
+
+    def test_fetch_spoken_object_to_handover(self):
+        r, calls = self.run_fetch("could you give me the bottle, the water bottle please")
+        self.assertEqual(r["message_type"], "fetch_result"); self.assertTrue(r["ok"])
+        self.assertEqual(r["label"], "water bottle")
+        a = calls[0]
+        self.assertEqual(a[a.index("--target") + 1], "water bottle")
+        self.assertEqual(a[a.index("--place") + 1:][:2], ["0", "30"])
+
+    def test_fetch_unknown_never_moves(self):
+        r, calls = self.run_fetch("the car keys")
+        self.assertFalse(r["ok"]); self.assertEqual(calls, [])
+        r, calls = self.run_fetch("water bottle", handover=None, bowl=None)   # no drop spot configured
+        self.assertFalse(r["ok"]); self.assertEqual(calls, [])
+
+    def test_fetch_dry_run_never_moves(self):
+        r, calls = self.run_fetch("water bottle", status="DRY_RUN", dry=True)
+        self.assertTrue(r["ok"]); self.assertNotIn("--go", calls[0])
+
     def test_check_taken_is_inconclusive(self):
         srv, base = serve(S.Service(ITEMS, "http://x", "none", None, fake=True))
         try:

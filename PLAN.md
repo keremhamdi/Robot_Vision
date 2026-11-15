@@ -10,6 +10,8 @@ Nothing was executed here: the sandbox has no torch, cv2, arm or camera. Everyth
 
 **Combining them:** `arm_service.py` (this repo) is the arm-side server for that contract. It maps the medicine name to an object in `items_v1.json`, runs `pick_v4`, and answers in the format Reachy expects. On Reachy only `MEDICINE_BUDDY_ARM_URL=http://<mac>:9090` changes, and the app's forced dry-run must be switched off. See `arm_service.py` for the details and `tests/test_arm_service.py` for the checks.
 
+**Update:** `arm_service.py` also serves `/v1/fetch` ("give me the water bottle"). The matching Reachy-side change (a `fetch_object` voice tool, plus un-hard-coding dry-run) is `reachy_patch/fetch_object.patch`; see `reachy_patch/README.md`. `voice_pick.py` is the direct voice-to-arm path on the Mac without Reachy.
+
 ## What exists (verified in code)
 | Part | State |
 |---|---|

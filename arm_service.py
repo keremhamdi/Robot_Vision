@@ -2,7 +2,8 @@
 arm_service.py — the "arm PC" side of Medicine Buddy's medicine_buddy.arm.v1 contract.
 
 Reachy Mini (LosPollosForTheElders) asks, after the person says yes:
-    POST /v1/dispense     {"medicine": {"name": "Aspirin", ...}, "dry_run": false, ...}
+    POST /v1/dispense     {"medicine": {"name": "Aspirin", ...}, "dry_run": false, ...}   medicine -> bowl
+    POST /v1/fetch        {"object": "water bottle", "dry_run": false, ...}               object -> hand-over spot
     POST /v1/check_taken  {...}
 This service answers with the JSON the Reachy side expects (dispense_result / check_taken_result)
 and does the real work with pick_v4 (SAM 3 finds the box -> table x,y -> arm grabs -> put in the bowl).
@@ -11,10 +12,14 @@ On the Reachy side only one setting changes:
     MEDICINE_BUDDY_ARM_URL=http://<this-mac>:9090      (and the app's dry_run must be off)
 
 Run
-    python arm_service.py --bowl -10 25 --vlm ollama --arm-url http://localhost:8890
+    python arm_service.py --bowl -10 25 --handover 0 30 --vlm ollama --arm-url http://localhost:8890
     python arm_service.py --fake            # no camera, no arm, no models: for testing the wiring
 
     curl localhost:9090/health
+
+Fetch: "object" is whatever the person said ("the bottle please"); it is matched against items_v1.json
+with the same closed-vocabulary matching as voice_pick.py (unknown or ambiguous -> failed, never a guess).
+--handover X Y is where the object is put down for the person (defaults to --bowl).
 
 Medicine name -> object: items_v1.json. An entry matches when the medicine name equals its key or one
 of its "aliases" (case-insensitive); its "category" is passed to the detector. Unknown medicine -> the
@@ -90,8 +95,9 @@ def map_status(status, dry_run):
 # ---------- the work ----------
 
 class Service:
-    def __init__(self, items, arm_url, vlm, bowl, fake=False, out_dir="runs", runner=None):
+    def __init__(self, items, arm_url, vlm, bowl, fake=False, out_dir="runs", runner=None, handover=None):
         self.items, self.arm_url, self.vlm, self.bowl = items, arm_url, vlm, bowl
+        self.handover = handover
         self.fake, self.out_dir = fake, out_dir
         self.runner = runner            # tests: replaces pick_v4.main
         self.lock = threading.Lock()
@@ -119,21 +125,40 @@ class Service:
             return self.result(rid, False, "failed", error=f"no object profile for medicine {name!r}; "
                                f"add it (or an alias) to {os.path.basename(self.items)}")
         target, category = found
+        return self._pick_and_place(rid, target, category, dry_run, self.bowl, "bowl",
+                                    slot_id=body.get("slot_hint"))
+
+    def fetch(self, body):
+        import voice_pick
+        rid = str(body.get("request_id") or "")
+        dry_run = bool(body.get("dry_run", False))
+        said = str(body.get("object") or "")
+        m = voice_pick.match_item(said, voice_pick.load_items(self.items))
+        res = lambda err: dict(self.result(rid, False, "failed", error=err), message_type="fetch_result")
+        if m[0] == "unknown":
+            return res(f"I don't know the object {said!r}; add it (or an alias) to {os.path.basename(self.items)}")
+        if m[0] == "ambiguous":
+            return res(f"{said!r} could mean {m[1][0]} or {m[1][1]}; refusing to guess")
+        drop = self.handover or self.bowl
+        out = self._pick_and_place(rid, m[1], m[2], dry_run, drop, "hand-over spot (--handover or --bowl)")
+        return dict(out, message_type="fetch_result")
+
+    def _pick_and_place(self, rid, target, category, dry_run, drop, drop_name, slot_id=None):
         if not self.lock.acquire(blocking=False):
             return self.result(rid, False, "aborted", error="arm busy with another request")
         try:
             if self.fake:
-                return self.result(rid, True, "placed", slot_id=body.get("slot_hint"), label=target.upper(),
+                return self.result(rid, True, "placed", slot_id=slot_id, label=target.upper(),
                                    place_verified=False, detail="fake mode: nothing was detected or moved")
-            if not dry_run and self.bowl is None:
+            if not dry_run and drop is None:
                 return self.result(rid, False, "failed", label=target,
-                                   error="no bowl position configured (start with --bowl X Y)")
+                                   error=f"no {drop_name} position configured (start with --bowl X Y / --handover X Y)")
             os.makedirs(self.out_dir, exist_ok=True)
             argv = ["--target", target, "--category", category, "--vlm", self.vlm,
                     "--arm-url", self.arm_url, "--items", self.items, "--no-show", "-y",
                     "--out", os.path.join(self.out_dir, f"{rid or int(time.time())}.jpg")]
             if not dry_run:
-                argv += ["--go", "--place", str(self.bowl[0]), str(self.bowl[1])]
+                argv += ["--go", "--place", str(drop[0]), str(drop[1])]
             buf, status = io.StringIO(), None
             try:
                 with contextlib.redirect_stdout(buf):
@@ -172,7 +197,7 @@ def make_handler(svc):
         def do_GET(self):
             if self.path == "/health":
                 self._send(200, {"ok": True, "schema": SCHEMA, "fake": svc.fake, "busy": svc.lock.locked(),
-                                 "bowl": svc.bowl, "vlm": svc.vlm})
+                                 "bowl": svc.bowl, "handover": svc.handover, "vlm": svc.vlm})
             else:
                 self._send(404, {"ok": False, "error": "not found"})
 
@@ -188,6 +213,8 @@ def make_handler(svc):
                 return self._send(400, {"ok": False, "error": f"unsupported schema {body.get('schema')!r}"})
             if self.path == "/v1/dispense":
                 return self._send(200, svc.dispense(body))
+            if self.path == "/v1/fetch":
+                return self._send(200, svc.fetch(body))
             if self.path == "/v1/check_taken":
                 return self._send(200, svc.check_taken(body))
             self._send(404, {"ok": False, "error": "not found"})
@@ -205,10 +232,12 @@ def main(argv=None):
     ap.add_argument("--arm-url", default="http://localhost:8890", help="the arm's own click page (pick_v4 --arm-url)")
     ap.add_argument("--vlm", choices=["none", "ollama", "claude"], default="ollama")
     ap.add_argument("--bowl", nargs=2, type=float, metavar=("X", "Y"), help="table x,y (cm) of the bowl")
+    ap.add_argument("--handover", nargs=2, type=float, metavar=("X", "Y"),
+                    help="table x,y (cm) where fetched objects are put for the person (default: the bowl)")
     ap.add_argument("--fake", action="store_true", help="answer without detection or motion (wiring test)")
     ap.add_argument("--out-dir", default=os.path.join(HERE, "runs"))
     a = ap.parse_args(argv)
-    svc = Service(a.items, a.arm_url, a.vlm, a.bowl, a.fake, a.out_dir)
+    svc = Service(a.items, a.arm_url, a.vlm, a.bowl, a.fake, a.out_dir, handover=a.handover)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(svc))
     print(f"arm_service on {a.host}:{a.port}  fake={a.fake} vlm={a.vlm} bowl={a.bowl}")
     try:
