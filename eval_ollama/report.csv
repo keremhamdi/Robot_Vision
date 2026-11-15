@@ -1,0 +1,15 @@
+image,target,expected,got,verdict,note,seconds
+wrist1.jpeg,energy drink can,GO,GO,PASS,,14.1
+wrist1.jpeg,Feetech servo box,GO|AMBIGUOUS,GO,PASS,,14.4
+wrist1.jpeg,white box,AMBIGUOUS,AMBIGUOUS,PASS,,7.4
+wrist1.jpeg,red soda can,NOT_FOUND,NOT_FOUND,PASS,,3.4
+wrist1.jpeg,water bottle,NOT_FOUND,NOT_FOUND,PASS,,21.0
+wrist1.jpeg,foam ring,GO,GO,PASS,,4.9
+wrist1.jpeg,black glasses case,GO,AMBIGUOUS,MISSED,"expected GO, got AMBIGUOUS",7.9
+wrist2.jpeg,energy drink can,NOT_FOUND,NOT_FOUND,PASS,,1.8
+wrist2.jpeg,Feetech servo box,GO|AMBIGUOUS,AMBIGUOUS,PASS,,14.4
+wrist2.jpeg,red soda can,NOT_FOUND,NOT_FOUND,PASS,,1.8
+wide1.jpeg,energy drink can,GO,GO,PASS,,10.7
+wide1.jpeg,foam ring,GO,GO,PASS,,4.6
+wide2.jpeg,Feetech servo box,GO|AMBIGUOUS,NOT_FOUND,MISSED,"expected GO, got NOT_FOUND",17.4
+wide2.jpeg,red soda can,NOT_FOUND,NOT_FOUND,PASS,,7.3
